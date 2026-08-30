@@ -3,6 +3,7 @@ import {
   Controller,
   Delete,
   Get,
+  Headers,
   HttpException,
   Param,
   Post,
@@ -66,6 +67,35 @@ import { UsersService } from '@gitroom/nestjs-libraries/database/prisma/users/us
 import { SuperAdminGuard } from '@gitroom/backend/services/auth/super.admin.guard';
 import { timer } from '@gitroom/helpers/utils/timer';
 import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
+import { createHmac, timingSafeEqual } from 'crypto';
+
+type SwayCueInstagramHandoff = {
+  handoffId: string;
+  swaycueWorkspaceId: string;
+  swaycueAccountId: string;
+  instagramId: string;
+  username: string;
+  name: string | null;
+  picture: string | null;
+  accessToken: string;
+  expiresIn: number;
+};
+
+function canonicalizeSwayCueInstagramHandoff(
+  body: SwayCueInstagramHandoff
+) {
+  return JSON.stringify({
+    handoffId: body.handoffId,
+    swaycueWorkspaceId: body.swaycueWorkspaceId,
+    swaycueAccountId: body.swaycueAccountId,
+    instagramId: body.instagramId,
+    username: body.username,
+    name: body.name,
+    picture: body.picture,
+    accessToken: body.accessToken,
+    expiresIn: body.expiresIn,
+  });
+}
 
 @ApiTags('Public API')
 @Controller('/public/v1')
@@ -314,6 +344,7 @@ export class PublicIntegrationsController {
       .filter((integration) => !group || integration.customer?.id === group)
       .map((integration) => ({
         id: integration.id,
+        externalAccountId: integration.internalId,
         name: integration.name,
         identifier: integration.providerIdentifier,
         picture: integration.picture,
@@ -326,6 +357,141 @@ export class PublicIntegrationsController {
             }
           : undefined,
       }));
+  }
+
+  /**
+   * Server-only SwayCue handoff. The API key selects the Postiz organization;
+   * the HMAC and single-use nonce authenticate the credential payload.
+   */
+  @Post('/integrations/provision-instagram')
+  async provisionInstagramFromSwayCue(
+    @GetOrgFromRequest() org: Organization,
+    @Body() rawBody: unknown,
+    @Headers('x-swaycue-handoff-signature') signature?: string,
+  ) {
+    Sentry.metrics.count('public_api-request', 1);
+    const secret = process.env.POSTIZ_HANDOFF_SECRET?.trim();
+    if (!secret || !signature) {
+      throw new HttpException({ msg: 'Invalid handoff authentication' }, 401);
+    }
+
+    if (!rawBody || typeof rawBody !== 'object') {
+      throw new HttpException({ msg: 'Invalid handoff payload' }, 400);
+    }
+    const body = rawBody as Partial<SwayCueInstagramHandoff>;
+    const allowedKeys = new Set([
+      'handoffId',
+      'swaycueWorkspaceId',
+      'swaycueAccountId',
+      'instagramId',
+      'username',
+      'name',
+      'picture',
+      'accessToken',
+      'expiresIn',
+    ]);
+    if (
+      Object.keys(body).some((key) => !allowedKeys.has(key)) ||
+      typeof body.handoffId !== 'string' ||
+      typeof body.swaycueWorkspaceId !== 'string' ||
+      typeof body.swaycueAccountId !== 'string' ||
+      typeof body.instagramId !== 'string' ||
+      typeof body.username !== 'string' ||
+      typeof body.accessToken !== 'string' ||
+      typeof body.expiresIn !== 'number'
+    ) {
+      throw new HttpException({ msg: 'Invalid handoff payload' }, 400);
+    }
+    const handoff: SwayCueInstagramHandoff = {
+      handoffId: body.handoffId ?? '',
+      swaycueWorkspaceId: body.swaycueWorkspaceId ?? '',
+      swaycueAccountId: body.swaycueAccountId ?? '',
+      instagramId: body.instagramId ?? '',
+      username: body.username ?? '',
+      name: body.name ?? null,
+      picture: body.picture ?? null,
+      accessToken: body.accessToken ?? '',
+      expiresIn: body.expiresIn ?? 0,
+    };
+    if (
+      !/^[0-9a-z]+_[A-Za-z0-9_-]{20,128}$/.test(handoff.handoffId) ||
+      !handoff.swaycueWorkspaceId ||
+      !handoff.swaycueAccountId ||
+      !handoff.instagramId ||
+      !handoff.username ||
+      !handoff.accessToken ||
+      !Number.isFinite(handoff.expiresIn) ||
+      handoff.expiresIn <= 0 ||
+      (handoff.name !== null && typeof handoff.name !== 'string') ||
+      (handoff.picture !== null && typeof handoff.picture !== 'string')
+    ) {
+      throw new HttpException({ msg: 'Invalid handoff payload' }, 400);
+    }
+
+    const handoffTimestamp = Number.parseInt(
+      handoff.handoffId.split('_', 1)[0],
+      36
+    );
+    if (
+      !Number.isFinite(handoffTimestamp) ||
+      handoffTimestamp > Date.now() + 60_000 ||
+      Date.now() - handoffTimestamp > 10 * 60_000
+    ) {
+      throw new HttpException({ msg: 'Handoff has expired' }, 409);
+    }
+
+    const expected = createHmac('sha256', secret)
+      .update(canonicalizeSwayCueInstagramHandoff(handoff))
+      .digest('base64url');
+    const signatureBuffer = Buffer.from(signature);
+    const expectedBuffer = Buffer.from(expected);
+    if (
+      signatureBuffer.length !== expectedBuffer.length ||
+      !timingSafeEqual(signatureBuffer, expectedBuffer)
+    ) {
+      throw new HttpException({ msg: 'Invalid handoff signature' }, 401);
+    }
+
+    const nonceKey = `swaycue:instagram:handoff:${handoff.handoffId}`;
+    const claimed = await ioRedis.set(nonceKey, '1', 'EX', 600, 'NX');
+    if (claimed !== 'OK') {
+      throw new HttpException({ msg: 'Handoff has already been used' }, 409);
+    }
+
+    const integrationProvider = this._integrationManager.getSocialIntegration(
+      'instagram-standalone'
+    );
+    if (!integrationProvider) {
+      throw new HttpException({ msg: 'Instagram provider is unavailable' }, 503);
+    }
+
+    const integration = await this._integrationService.createOrUpdateIntegration(
+      undefined,
+      false,
+      org.id,
+      handoff.name?.trim() || handoff.username,
+      handoff.picture || undefined,
+      'social',
+      handoff.instagramId,
+      'instagram-standalone',
+      handoff.accessToken,
+      handoff.accessToken,
+      handoff.expiresIn,
+      handoff.username,
+      false,
+    );
+
+    this._refreshIntegrationService
+      .startRefreshWorkflow(org.id, integration.id, integrationProvider)
+      .catch(() => {});
+
+    return {
+      integrationId: integration.id,
+      provider: 'instagram-standalone' as const,
+      instagramId: handoff.instagramId,
+      username: handoff.username,
+      externalAccountId: integration.internalId,
+    };
   }
 
   @Get('/social/:integration')
