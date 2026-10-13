@@ -413,6 +413,9 @@ export class PublicIntegrationsController {
       accessToken: body.accessToken ?? '',
       expiresIn: body.expiresIn ?? 0,
     };
+    if (process.env.POSTIZ_HEADLESS_ENABLED === 'true' && handoff.swaycueWorkspaceId !== org.id) {
+      throw new HttpException({ msg: 'Workspace does not match publishing credential' }, 403);
+    }
     if (
       !/^[0-9a-z]+_[A-Za-z0-9_-]{20,128}$/.test(handoff.handoffId) ||
       !handoff.swaycueWorkspaceId ||

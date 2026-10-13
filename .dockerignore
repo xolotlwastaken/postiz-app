@@ -21,3 +21,12 @@ dist
 .git
 .github
 reports
+
+# Runtime credentials, local receipts and private material never enter builds.
+.env*
+.release
+.local-backups
+certificates
+**/*.pem
+**/*.key
+**/*.private.json

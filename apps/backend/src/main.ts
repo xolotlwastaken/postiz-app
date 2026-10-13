@@ -13,6 +13,7 @@ import cookieParser from 'cookie-parser';
 import { Logger, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
+import { HeadlessModule } from './swaycue/headless.module';
 
 import { SubscriptionExceptionFilter } from '@gitroom/backend/services/auth/permissions/subscription.exception';
 import { PostValidationExceptionFilter } from '@gitroom/backend/api/routes/posts.validation.exception';
@@ -21,7 +22,12 @@ import { ConfigurationChecker } from '@gitroom/helpers/configuration/configurati
 import { startMcp } from '@gitroom/nestjs-libraries/chat/start.mcp';
 
 async function start() {
-  const app = await NestFactory.create(AppModule, {
+  const headless = process.env.POSTIZ_HEADLESS_ENABLED === 'true';
+  if (headless && (!process.env.POSTIZ_HANDOFF_SECRET || !process.env.REDIS_URL ||
+      new URL(process.env.DATABASE_URL || '').searchParams.get('schema') !== 'postiz')) {
+    throw new Error('Headless publishing requires a handoff secret, Redis and DATABASE_URL with schema=postiz');
+  }
+  const app = await NestFactory.create(headless ? HeadlessModule : AppModule, {
     rawBody: true,
     cors: {
       ...(!process.env.NOT_SECURED ? { credentials: true } : {}),
@@ -48,7 +54,7 @@ async function start() {
     },
   });
 
-  await startMcp(app);
+  if (!headless) await startMcp(app);
 
   app.useGlobalPipes(
     new ValidationPipe({
@@ -79,6 +85,10 @@ async function start() {
     Logger.log(`🚀 Backend is running on: http://localhost:${port}`);
   } catch (e) {
     Logger.error(`Backend failed to start on port ${port}`, e);
+    if (headless) {
+      await app.close();
+      process.exit(1);
+    }
   }
 }
 
