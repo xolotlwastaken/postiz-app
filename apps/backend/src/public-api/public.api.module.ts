@@ -16,7 +16,7 @@ const authenticatedController = [PublicIntegrationsController];
 @Module({
   imports: [UploadModule],
   controllers: process.env.MCP_ONLY ? [] : [...authenticatedController],
-  providers: [
+  providers: process.env.POSTIZ_HEADLESS_ENABLED === 'true' ? [IntegrationManager] : [
     AuthService,
     StripeService,
     OpenaiService,

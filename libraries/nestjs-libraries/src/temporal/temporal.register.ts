@@ -28,7 +28,9 @@ export class TemporalRegister implements OnModuleInit {
         namespace: process.env.TEMPORAL_NAMESPACE || 'default',
         searchAttributes: missingAttributes.reduce((all, current) => {
           // @ts-ignore
-          all[current] = 1;
+          // These are exact identifiers. Keyword works with SQL visibility;
+          // the standalone stack retains its existing Text attributes.
+          all[current] = process.env.POSTIZ_HEADLESS_ENABLED === 'true' ? 2 : 1;
           return all;
         }, {}),
       });

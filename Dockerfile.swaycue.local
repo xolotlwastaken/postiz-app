@@ -1,0 +1,16 @@
+# Reuse the installed runtime/dependencies, compile the local SwayCue handoff.
+ARG POSTIZ_BASE_IMAGE=ghcr.io/gitroomhq/postiz-app@sha256:785f97312f66a347fb96cdccc4ded5a33ced69a672c89a9adc8054e7d6a21dc5
+FROM ${POSTIZ_BASE_IMAGE}
+WORKDIR /app
+# The checked-out upload code requires the current buffer detection API.
+RUN npm install --prefix /opt/swaycue-dependencies --ignore-scripts --no-audit --no-fund file-type@22.0.2 \
+    && mkdir -p /app/node_modules/music-metadata/node_modules \
+    && mv /app/node_modules/file-type /app/node_modules/music-metadata/node_modules/file-type \
+    && ln -s /opt/swaycue-dependencies/node_modules/file-type /app/node_modules/file-type
+COPY apps/backend /app/apps/backend
+COPY apps/orchestrator /app/apps/orchestrator
+COPY libraries /app/libraries
+COPY tsconfig.base.json tsconfig.json /app/
+RUN pnpm exec prisma generate --schema=libraries/nestjs-libraries/src/database/prisma/schema.prisma
+RUN NODE_OPTIONS=--max-old-space-size=6144 pnpm --filter postiz-backend run build
+RUN NODE_OPTIONS=--max-old-space-size=6144 pnpm --filter postiz-orchestrator run build
