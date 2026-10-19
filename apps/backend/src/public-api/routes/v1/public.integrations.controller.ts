@@ -218,6 +218,29 @@ export class PublicIntegrationsController {
     };
   }
 
+  @Get('/posts/:id')
+  async getPost(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string
+  ) {
+    const post = await this._postsService.getPostById(id, org.id);
+    if (!post || post.deletedAt) {
+      throw new HttpException({ msg: 'Post not found' }, 404);
+    }
+    // Return only the editor contract, never integration credentials.
+    return {
+      id: post.id,
+      content: post.content,
+      publishDate: post.publishDate,
+      state: post.state,
+      releaseId: post.releaseId,
+      releaseURL: post.releaseURL,
+      image: post.image,
+      settings: post.settings,
+      integration: { id: post.integrationId },
+    };
+  }
+
   @Post('/posts')
   @CheckPolicies([AuthorizationActions.Create, Sections.POSTS_PER_MONTH])
   async createPost(
