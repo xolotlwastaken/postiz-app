@@ -1,3 +1,7 @@
+import { Context } from '@temporalio/activity';
+import { ApplicationFailure } from '@temporalio/common';
+import { PrismaService } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
+import { authorizePublishingDispatch, resolvePublishingPostId } from './publishing-policy';
 import { Injectable } from '@nestjs/common';
 import {
   Activity,
@@ -103,8 +107,25 @@ export class PostActivity {
     private _refreshIntegrationService: RefreshIntegrationService,
     private _webhookService: WebhooksService,
     private _temporalService: TemporalService,
-    private _subscriptionService: SubscriptionService
+    private _subscriptionService: SubscriptionService,
+    private readonly db: PrismaService
   ) {}
+
+  private async assertPublishingAuthorized(integration: Integration, posts?: Post[]) {
+    try {
+      const postIds = posts?.map(post => post.id) ?? [await resolvePublishingPostId(
+        Context.current().info.workflowExecution,
+        async (workflowId, runId) => {
+          const description = await this._temporalService.client.getRawClient().workflow.getHandle(workflowId, runId).describe();
+          return { postId: description.typedSearchAttributes.get(postIdSearchParam) };
+        }
+      )];
+      await authorizePublishingDispatch({ workspaceId: integration.organizationId, integrationId: integration.id, postIds }, this.db);
+    } catch (error) {
+      // Frozen workflow versions recognize bad_body as terminal; a new type would enter their manual retry loops.
+      throw ApplicationFailure.nonRetryable(error instanceof Error ? error.message : 'Publishing authorization unavailable', 'bad_body');
+    }
+  }
 
   @ActivityMethod()
   async getIntegrationById(orgId: string, id: string) {
@@ -211,6 +232,7 @@ export class PostActivity {
     integration: Integration,
     posts: Post[]
   ) {
+    await this.assertPublishingAuthorized(integration, posts);
     // kept only for in-flight postWorkflowV108 runs, which set a
     // heartbeatTimeout on this activity - removing the sender would kill
     // them. Under V109+ (no heartbeatTimeout) this is a no-op and can be
@@ -249,7 +271,10 @@ export class PostActivity {
                 getIntegration?.convertToJPEG || false
               ),
             }))
-          ),
+          ).then(async prepared => {
+            await this.assertPublishingAuthorized(integration, posts);
+            return prepared;
+          }),
           integration
         );
       })
@@ -326,6 +351,7 @@ export class PostActivity {
     posts: Post[],
     allowPending: boolean
   ) {
+    await this.assertPublishingAuthorized(integration, posts);
     // Stage markers: whatever ran last is what a timed-out activity reports.
     // Providers that go through this.fetch overwrite these with the exact URL;
     // the ones on their own HTTP client (x, youtube, bluesky) are still
@@ -372,6 +398,7 @@ export class PostActivity {
       }))
     );
 
+    await this.assertPublishingAuthorized(integration, posts);
     setHeartbeatDetails(`${integration.providerIdentifier}: publish`);
     const postNow =
       allowPending && getIntegration.postPending
@@ -415,6 +442,7 @@ export class PostActivity {
 
   @ActivityMethod()
   async checkPostStatus(integration: Integration, pendingData: any) {
+    await this.assertPublishingAuthorized(integration);
     const getIntegration = this._integrationManager.getSocialIntegration(
       integration.providerIdentifier
     );
@@ -426,6 +454,7 @@ export class PostActivity {
 
   @ActivityMethod()
   async finalizePost(integration: Integration, pendingData: any) {
+    await this.assertPublishingAuthorized(integration);
     const getIntegration = this._integrationManager.getSocialIntegration(
       integration.providerIdentifier
     );
